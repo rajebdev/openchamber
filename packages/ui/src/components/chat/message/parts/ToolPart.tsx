@@ -4,14 +4,15 @@ import { RuntimeAPIContext } from '@/contexts/runtimeAPIContext';
 import { PatchDiff } from '@pierre/diffs/react';
 import { cn } from '@/lib/utils';
 import { SimpleMarkdownRenderer } from '../../MarkdownRenderer';
+import { MessageFilesDisplay } from '../../FileAttachment';
 import { getToolMetadata } from '@/lib/toolHelpers';
-import type { ToolPart as ToolPartType, ToolState as ToolStateUnion } from '@opencode-ai/sdk/v2';
+import type { ToolPart as ToolPartType, ToolState as ToolStateUnion, FilePart } from '@opencode-ai/sdk/v2';
 import { toolDisplayStyles } from '@/lib/typography';
 import { WorkerHighlightedCode } from '@/components/code/WorkerHighlightedCode';
 import { useOptionalThemeSystem } from '@/contexts/useThemeSystem';
 import { useEffectiveDirectory } from '@/hooks/useEffectiveDirectory';
 import { useSessionUIStore } from '@/sync/session-ui-store';
-import { useDirectorySync, useSessionMessageRecords, useEnsureSessionMessages } from '@/sync/sync-context';
+import { useSessionMessageRecords, useEnsureSessionMessages } from '@/sync/sync-context';
 import { useUIStore } from '@/stores/useUIStore';
 import { sessionEvents } from '@/lib/sessionEvents';
 import { ScrollShadow } from '@/components/ui/ScrollShadow';
@@ -24,15 +25,37 @@ import type { ContentChangeReason } from '@/hooks/useChatAutoFollow';
 import type { ToolPopupContent } from '../types';
 import { ensurePierreThemeRegistered } from '@/lib/shiki/appThemeRegistry';
 import { getDefaultTheme } from '@/lib/theme/themes';
-import type { MessageRecord } from '@/lib/messageCompletion';
 
 import {
     formatEditOutput,
     detectLanguageFromOutput,
     formatInputForDisplay,
-    renderTodoOutput,
     tryParseJsonOutput,
     coerceToText,
+    renderLspDiagnosticsOutput,
+    renderLspGotoDefinitionOutput,
+    renderLspFindReferencesOutput,
+    renderLspSymbolsOutput,
+    renderLspRenameOutput,
+    renderLspPrepareRenameOutput,
+    renderSessionListOutput,
+    renderSessionReadOutput,
+    renderSessionInfoOutput,
+    renderSessionSearchOutput,
+    renderBackgroundOutputOutput,
+    renderMonitorOutputOutput,
+    renderSkillMcpOutput,
+    renderHashlineEditOutput,
+    renderCodeSearchOutput,
+    renderWebFetchOutput,
+    renderStructuredOutput,
+    renderPlanModeOutput,
+    renderGrepOutput,
+    renderGlobOutput,
+    renderListOutput,
+    renderTodoOutput,
+    renderWebSearchOutput,
+    renderMarkdownOutput,
 } from '../toolRenderers';
 import { JsonTreeViewer } from '@/components/ui/JsonTreeViewer';
 import { JsonSummaryView } from './JsonSummaryView';
@@ -42,17 +65,25 @@ import { MinDurationShineText } from './MinDurationShineText';
 import { ToolRevealOnMount } from './ToolRevealOnMount';
 import { getToolIcon } from './toolPresentation';
 import { useDurationTickerNow } from './useDurationTicker';
-import { resolveFallbackTaskSessionId } from './resolveFallbackTaskSessionId';
-import { readTaskTagSessionIdFromOutput } from './taskSessionIdParser';
+import {
+    buildTaskSummaryEntriesFromSession,
+    normalizeTaskSummaryEntries,
+    parseTaskMetadataBlock,
+    readTaskSessionIdFromOutput,
+    readTaskSessionIdFromRecord,
+    stripTaskMetadataFromOutput,
+    type TaskToolSummaryEntry,
+} from './taskToolModel';
 import { areRenderRelevantPartsEqual } from '../renderCompare';
 import { useI18n } from '@/lib/i18n';
 import { getDiffPatchEntries, getPatchText, type DiffPatchEntry } from './toolDiffUtils';
+import { isEmbeddedSessionChat } from '@/components/layout/contextPanelEmbeddedChat';
 
 const TOOL_ROW_TEXT_CLASS = '!text-[length:var(--text-meta)] !leading-5 sm:!leading-6 tracking-normal';
 const TOOL_ROW_TITLE_CLASS = cn('typography-meta font-medium', TOOL_ROW_TEXT_CLASS);
 const TOOL_ROW_DESCRIPTION_CLASS = cn('typography-meta', TOOL_ROW_TEXT_CLASS);
 
-type ToolStateWithMetadata = ToolStateUnion & { metadata?: Record<string, unknown>; input?: Record<string, unknown>; output?: string; error?: string; time?: { start: number; end?: number } };
+type ToolStateWithMetadata = ToolStateUnion & { metadata?: Record<string, unknown>; input?: Record<string, unknown>; output?: string; error?: string; time?: { start: number; end?: number }; attachments?: Array<FilePart> };
 
 interface ToolPartProps {
     part: ToolPartType;
@@ -163,7 +194,6 @@ const normalizeToolName = (toolName: string | undefined | null): string => {
 };
 
 const MAX_DURATION_MS = 5 * 60 * 1000; // 5 minutes cap
-const TASK_TOOL_FALLBACK_RETRY_MS = 3000;
 const GIT_REFRESH_MUTATING_TOOLS = new Set([
     'bash',
     'edit',
@@ -294,6 +324,15 @@ const parseWriteLineCount = (input?: Record<string, unknown>): number | null => 
         }
     }
     return lines;
+};
+
+const parseTodoProgress = (input?: Record<string, unknown>): {  total: number; completed: number; inProgress: number; pending: number } | null => {
+    if (!input?.todos || !Array.isArray(input.todos)) return null;
+    const total = input.todos.length;
+    const completed = input.todos.filter((todo): todo is { status: 'completed' } => todo.status === 'completed').length;
+    const pending = input.todos.filter((todo): todo is { status: 'pending' } => todo.status === 'pending').length;
+    const inProgress = input.todos.filter((todo): todo is { status: 'in_progress' } => todo.status === 'in_progress').length;
+    return { total, completed, inProgress, pending };
 };
 
 const extractFirstChangedLineFromDiff = (diffText: string): number | undefined => {
@@ -964,94 +1003,6 @@ const ToolScrollableTextOutput: React.FC<{
 
 ToolScrollableTextOutput.displayName = 'ToolScrollableTextOutput';
 
-type TaskToolSummaryEntry = {
-    id?: string;
-    tool?: string;
-    state?: {
-        status?: string;
-        title?: string;
-        input?: Record<string, unknown>;
-    };
-};
-
-type SessionMessageWithParts = MessageRecord;
-
-const normalizeSessionIdCandidate = (value: unknown): string | undefined => {
-    if (typeof value !== 'string') {
-        return undefined;
-    }
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
-};
-
-const readTaskSessionIdFromRecord = (value: unknown): string | undefined => {
-    if (!value || typeof value !== 'object') {
-        return undefined;
-    }
-
-    const record = value as Record<string, unknown>;
-    return (
-        normalizeSessionIdCandidate(record.sessionID)
-        ?? normalizeSessionIdCandidate(record.sessionId)
-    );
-};
-
-const readTaskSessionIdFromOutput = (output: string | undefined): string | undefined => {
-    if (typeof output !== 'string' || output.trim().length === 0) {
-        return undefined;
-    }
-    const parsedMetadata = parseTaskMetadataBlock(output);
-    if (parsedMetadata.sessionId) {
-        return parsedMetadata.sessionId;
-    }
-    const taskMatch = output.match(/task_id\s*:\s*([^\s<"']+)/i);
-    const sessionMatch = output.match(/session[_\s-]?id\s*:\s*([^\s<"']+)/i);
-    const candidate = taskMatch?.[1] ?? sessionMatch?.[1];
-    if (candidate) {
-        return normalizeSessionIdCandidate(candidate);
-    }
-
-    // OpenCode tool output may wrap child session id in <task id="ses_xxx">
-    const taskTagSessionId = readTaskTagSessionIdFromOutput(output);
-    if (taskTagSessionId) {
-        return normalizeSessionIdCandidate(taskTagSessionId);
-    }
-    return undefined;
-};
-
-const buildTaskSummaryEntriesFromSession = (messages: SessionMessageWithParts[]): TaskToolSummaryEntry[] => {
-    const entries: TaskToolSummaryEntry[] = [];
-
-    for (const message of messages) {
-        if (message?.info?.role !== 'assistant') {
-            continue;
-        }
-        const parts = Array.isArray(message.parts) ? message.parts : [];
-        for (const part of parts) {
-            if (part?.type !== 'tool') {
-                continue;
-            }
-            const toolName = normalizeToolName(part.tool);
-            if (!toolName || toolName === 'task' || toolName === 'todowrite' || toolName === 'todoread') {
-                continue;
-            }
-            const partState = part.state as { status?: string; title?: string; input?: unknown } | undefined;
-            entries.push({
-                id: part.id,
-                tool: part.tool,
-                state: {
-                    status: partState?.status,
-                    title: partState?.title,
-                    input: partState?.input && typeof partState.input === 'object'
-                        ? (partState.input as Record<string, unknown>)
-                        : undefined,
-                },
-            });
-        }
-    }
-
-    return entries;
-};
 
 const getTaskSummaryLabel = (entry: TaskToolSummaryEntry): string => {
     const title = entry.state?.title;
@@ -1069,6 +1020,61 @@ const getTaskSummaryLabel = (entry: TaskToolSummaryEntry): string => {
         const urlCandidate = input.url;
         if (typeof urlCandidate === 'string' && urlCandidate.trim().length > 0) {
             return urlCandidate.trim();
+        }
+
+        const nameCandidate = input.name;
+        if (typeof nameCandidate === 'string' && nameCandidate.trim().length > 0) {
+            return nameCandidate.trim();
+        }
+
+        const commandCandidate = input.command;
+        if (typeof commandCandidate === 'string' && commandCandidate.trim().length > 0) {
+            return commandCandidate.trim();
+        }
+
+        const patternCandidate = input.pattern;
+        if (typeof patternCandidate === 'string' && patternCandidate.trim().length > 0) {
+            return patternCandidate.trim();
+        }
+
+        const queryCandidate = input.query;
+        if (typeof queryCandidate === 'string' && queryCandidate.trim().length > 0) {
+            return queryCandidate.trim();
+        }
+
+        const descriptionCandidate = input.description;
+        if (typeof descriptionCandidate === 'string' && descriptionCandidate.trim().length > 0) {
+            return descriptionCandidate.trim();
+        }
+
+        const goalCandidate = input.goal;
+        if (typeof goalCandidate === 'string' && goalCandidate.trim().length > 0) {
+            return goalCandidate.trim();
+        }
+
+        const mcpNameCandidate = input.mcp_name;
+        if (typeof mcpNameCandidate === 'string' && mcpNameCandidate.trim().length > 0) {
+            return mcpNameCandidate.trim();
+        }
+
+        const toolNameCandidate = input.tool_name;
+        if (typeof toolNameCandidate === 'string' && toolNameCandidate.trim().length > 0) {
+            return toolNameCandidate.trim();
+        }
+
+        const subagentTypeCandidate = input.subagent_type;
+        if (typeof subagentTypeCandidate === 'string' && subagentTypeCandidate.trim().length > 0) {
+            return subagentTypeCandidate.trim();
+        }
+
+        const sessionIdCandidate = input.session_id;
+        if (typeof sessionIdCandidate === 'string' && sessionIdCandidate.trim().length > 0) {
+            return sessionIdCandidate.trim();
+        }
+
+        const taskIdCandidate = input.task_id;
+        if (typeof taskIdCandidate === 'string' && taskIdCandidate.trim().length > 0) {
+            return taskIdCandidate.trim();
         }
     }
 
@@ -1248,105 +1254,6 @@ const TaskSummaryEntriesList = React.memo(({
 
 TaskSummaryEntriesList.displayName = 'TaskSummaryEntriesList';
 
-const stripTaskMetadataFromOutput = (output: string): string => {
-    // Strip only a trailing <task_metadata>...</task_metadata> block.
-    return output.replace(/\n*<task_metadata>[\s\S]*?<\/task_metadata>\s*$/i, '').trimEnd();
-};
-
-const normalizeTaskSummaryEntries = (value: unknown): TaskToolSummaryEntry[] => {
-    if (!Array.isArray(value)) {
-        return [];
-    }
-
-    const normalized: TaskToolSummaryEntry[] = [];
-    for (const entry of value) {
-        if (typeof entry === 'string') {
-            normalized.push({
-                tool: 'tool',
-                state: { status: 'completed', title: entry },
-            });
-            continue;
-        }
-
-        if (!entry || typeof entry !== 'object') {
-            continue;
-        }
-
-        const record = entry as {
-            id?: unknown;
-            tool?: unknown;
-            title?: unknown;
-            status?: unknown;
-            state?: { status?: unknown; title?: unknown; input?: unknown };
-        };
-
-        const stateStatus = typeof record.state?.status === 'string' ? record.state.status : undefined;
-        const stateTitle = typeof record.state?.title === 'string' ? record.state.title : undefined;
-        const status = stateStatus ?? (typeof record.status === 'string' ? record.status : undefined);
-        const title = stateTitle ?? (typeof record.title === 'string' ? record.title : undefined);
-
-        normalized.push({
-            id: typeof record.id === 'string' ? record.id : undefined,
-            tool: typeof record.tool === 'string' ? record.tool : 'tool',
-            state: {
-                status,
-                title,
-                input: record.state?.input && typeof record.state.input === 'object'
-                    ? (record.state.input as Record<string, unknown>)
-                    : undefined,
-            },
-        });
-    }
-
-    return normalized;
-};
-
-const parseTaskMetadataBlock = (output: string | undefined): {
-    sessionId?: string;
-    summaryEntries: TaskToolSummaryEntry[];
-} => {
-    if (typeof output !== 'string' || output.trim().length === 0) {
-        return { summaryEntries: [] };
-    }
-
-    const blockMatch = output.match(/<task_metadata>\s*([\s\S]*?)\s*<\/task_metadata>/i);
-    if (!blockMatch?.[1]) {
-        return { summaryEntries: [] };
-    }
-
-    const raw = blockMatch[1].trim();
-    if (!raw) {
-        return { summaryEntries: [] };
-    }
-
-    try {
-        const parsed = JSON.parse(raw) as {
-            sessionId?: unknown;
-            sessionID?: unknown;
-            summary?: unknown;
-            entries?: unknown;
-            tools?: unknown;
-            calls?: unknown;
-        };
-
-        const summaryEntries = normalizeTaskSummaryEntries(
-            parsed.summary ?? parsed.entries ?? parsed.tools ?? parsed.calls
-        );
-
-        const sessionId =
-            (typeof parsed.sessionId === 'string' && parsed.sessionId.trim().length > 0
-                ? parsed.sessionId.trim()
-                : undefined) ??
-            (typeof parsed.sessionID === 'string' && parsed.sessionID.trim().length > 0
-                ? parsed.sessionID.trim()
-                : undefined);
-
-        return { sessionId, summaryEntries };
-    } catch {
-        return { summaryEntries: [] };
-    }
-};
-
 const TaskToolSummary: React.FC<{
     entries: TaskToolSummaryEntry[];
     isExpanded: boolean;
@@ -1374,7 +1281,10 @@ const TaskToolSummary: React.FC<{
     const handleOpenSession = (event: React.MouseEvent) => {
         event.stopPropagation();
         if (sessionId && currentDirectory) {
-            if (isMobile || runtime?.runtime.isVSCode) {
+            // In contexts with no ContextPanel (embedded session-chat iframe)
+            // or single-surface layouts (mobile, VS Code), navigate in place.
+            // Otherwise open a new side-panel tab.
+            if (isEmbeddedSessionChat() || isMobile || runtime?.runtime.isVSCode) {
                 setCurrentSession(sessionId, currentDirectory);
                 return;
             }
@@ -1670,6 +1580,7 @@ interface ToolExpandedContentProps {
     state: ToolStateUnion;
     currentDirectory: string;
     isExpanded: boolean;
+    isMobile: boolean;
     onShowPopup?: (content: ToolPopupContent) => void;
 }
 
@@ -1678,6 +1589,7 @@ const ToolExpandedContent: React.FC<ToolExpandedContentProps> = React.memo(({
     state,
     currentDirectory,
     isExpanded,
+    isMobile,
     onShowPopup,
 }) => {
     const { t } = useI18n();
@@ -1690,6 +1602,7 @@ const ToolExpandedContent: React.FC<ToolExpandedContentProps> = React.memo(({
     const rawOutput = stateWithData.output;
     const hasStringOutput = typeof rawOutput === 'string' && rawOutput.length > 0;
     const outputString = typeof rawOutput === 'string' ? rawOutput : '';
+    const attachments = stateWithData.attachments;
 
     const fileDiff = isRecord(metadata?.filediff) ? metadata.filediff : undefined;
     const diffContent = getPatchText((metadata as { patch?: unknown } | undefined)?.patch)
@@ -1976,6 +1889,126 @@ const ToolExpandedContent: React.FC<ToolExpandedContentProps> = React.memo(({
             return null;
         }
 
+        // LSP Tools
+        if (part.tool === 'lsp_diagnostics' && hasStringOutput) {
+            const rendered = renderLspDiagnosticsOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'lsp_goto_definition' && hasStringOutput) {
+            const rendered = renderLspGotoDefinitionOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'lsp_find_references' && hasStringOutput) {
+            const rendered = renderLspFindReferencesOutput(outputString, undefined, t);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'lsp_symbols' && hasStringOutput) {
+            const rendered = renderLspSymbolsOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'lsp_rename' && hasStringOutput) {
+            const rendered = renderLspRenameOutput(outputString, undefined, t);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'lsp_prepare_rename' && hasStringOutput) {
+            const rendered = renderLspPrepareRenameOutput(outputString, undefined, t);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        // Session Tools
+        if (part.tool === 'session_list' && hasStringOutput) {
+            const rendered = renderSessionListOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'session_read' && hasStringOutput) {
+            const rendered = renderSessionReadOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'session_info' && hasStringOutput) {
+            const rendered = renderSessionInfoOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'session_search' && hasStringOutput) {
+            const rendered = renderSessionSearchOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        // Background & Monitor Tools
+        if (part.tool === 'background_output' && hasStringOutput) {
+            const rendered = renderBackgroundOutputOutput(outputString, undefined, t);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'monitor_output' && hasStringOutput) {
+            const rendered = renderMonitorOutputOutput(outputString, undefined, t);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        // Other Tools
+        if ((part.tool === 'skill_mcp' || part.tool === 'skill-mcp') && hasStringOutput) {
+            const rendered = renderSkillMcpOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'grep' && hasStringOutput) {
+            const rendered = renderGrepOutput(outputString, isMobile);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'glob' && hasStringOutput) {
+            const rendered = renderGlobOutput(outputString, isMobile);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'list' && hasStringOutput) {
+            const rendered = renderListOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'websearch_web_search_exa' && hasStringOutput) {
+            const rendered = renderWebSearchOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'hashline_edit' && hasStringOutput) {
+            const rendered = renderHashlineEditOutput(outputString, undefined, t);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        // Code Search & Web Tools
+        if (part.tool === 'codesearch' && hasStringOutput) {
+            const rendered = renderCodeSearchOutput(outputString, undefined, t);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if (part.tool === 'webfetch' && hasStringOutput) {
+            const rendered = renderWebFetchOutput(outputString, undefined, t);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if ((part.tool === 'structuredoutput' || part.tool === 'structured_output') && hasStringOutput) {
+            const rendered = renderStructuredOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if ((part.tool === 'plan_enter' || part.tool === 'plan_exit') && hasStringOutput) {
+            const rendered = renderPlanModeOutput(outputString, part.tool);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
+        if ((part.tool.startsWith('codegraph_') || part.tool.startsWith('grep_app_') || part.tool.startsWith('context7_')) && hasStringOutput) {
+            const rendered = renderMarkdownOutput(outputString);
+            if (rendered) return renderScrollableBlock(rendered, { className: 'p-1' });
+        }
+
         if (hasStringOutput && outputString.trim()) {
             return renderScrollableBlock(
                 <ToolScrollableTextOutput
@@ -2104,6 +2137,10 @@ const ToolExpandedContent: React.FC<ToolExpandedContentProps> = React.memo(({
                     )}
                 </>
             )}
+
+            {Array.isArray(attachments) && attachments.length > 0 && state.status === 'completed' ? (
+                <MessageFilesDisplay files={attachments} onShowPopup={onShowPopup} compact />
+            ) : null}
         </div>
     );
 });
@@ -2119,10 +2156,10 @@ const ToolPartContent: React.FC<ToolPartProps> = ({
     onShowPopup,
     animateTailText = true,
 }) => {
+    const { t } = useI18n();
     const state = part.state;
     const showToolFileIcons = useUIStore((s) => s.showToolFileIcons);
     const currentDirectory = useEffectiveDirectory() ?? '';
-    const currentSessionId = useSessionUIStore((s) => s.currentSessionId);
 
     const normalizedPartTool = normalizeToolName(part.tool);
     const isTaskTool = normalizedPartTool === 'task';
@@ -2254,16 +2291,6 @@ const ToolPartContent: React.FC<ToolPartProps> = ({
         return Math.min(...candidates);
     }, [localStartAt, pinnedTime.start, time?.start]);
 
-    const taskSessionResolutionStart = React.useMemo(() => {
-        if (typeof pinnedTime.start === 'number') {
-            return pinnedTime.start;
-        }
-        if (typeof time?.start === 'number') {
-            return time.start;
-        }
-        return localStartAt;
-    }, [localStartAt, pinnedTime.start, time?.start]);
-
     const taskOutputString = React.useMemo(() => {
         return typeof stateWithData.output === 'string' ? stateWithData.output : undefined;
     }, [stateWithData.output]);
@@ -2271,10 +2298,6 @@ const ToolPartContent: React.FC<ToolPartProps> = ({
     const parsedTaskMetadata = React.useMemo(() => {
         return parseTaskMetadataBlock(taskOutputString);
     }, [taskOutputString]);
-
-    // Track whether fallback session resolution has failed at least once.
-    // When true, resolveFallbackTaskSessionId widens its time window (3s → 8s).
-    const [taskFallbackRetried, setTaskFallbackRetried] = React.useState(false);
 
     const metadataTaskSummaryEntries = React.useMemo<TaskToolSummaryEntry[]>(() => {
         if (!isTaskTool) {
@@ -2294,11 +2317,13 @@ const ToolPartContent: React.FC<ToolPartProps> = ({
 
     const hasFinalMetadataTaskSummary = isFinalized && metadataTaskSummaryEntries.length > 0;
 
-    const explicitTaskSessionId = React.useMemo<string | undefined>(() => {
+    const taskSessionId = React.useMemo<string | undefined>(() => {
         if (!isTaskTool) {
             return undefined;
         }
 
+        // Current OpenCode publishes this authoritative join while the Task is
+        // running. The remaining sources only support older persisted parts.
         const metadataSessionId = readTaskSessionIdFromRecord(metadata);
         if (metadataSessionId) {
             return metadataSessionId;
@@ -2315,25 +2340,6 @@ const ToolPartContent: React.FC<ToolPartProps> = ({
         return readTaskSessionIdFromOutput(taskOutputString);
     }, [isTaskTool, metadata, parsedTaskMetadata.sessionId, partMetadata, taskOutputString]);
 
-    const fallbackTaskSessionId = useDirectorySync(
-        React.useCallback((storeState) => {
-            if (explicitTaskSessionId) {
-                return undefined;
-            }
-
-            return resolveFallbackTaskSessionId({
-                isTaskTool,
-                parentSessionId: currentSessionId ?? undefined,
-                taskStartTime: taskSessionResolutionStart,
-                sessions: storeState.session,
-                sessionStatusMap: storeState.session_status,
-                hasRetried: taskFallbackRetried,
-            });
-        }, [explicitTaskSessionId, isTaskTool, currentSessionId, taskSessionResolutionStart, taskFallbackRetried]),
-        currentDirectory,
-    );
-
-    const taskSessionId = explicitTaskSessionId ?? fallbackTaskSessionId;
     const childSessionLookupId = hasFinalMetadataTaskSummary ? '' : (taskSessionId ?? '');
 
     const childSessionMessages = useSessionMessageRecords(childSessionLookupId, currentDirectory);
@@ -2348,43 +2354,6 @@ const ToolPartContent: React.FC<ToolPartProps> = ({
         }
         return buildTaskSummaryEntriesFromSession(childSessionMessages);
     }, [childSessionMessages, isTaskTool, taskSessionId]);
-
-    React.useEffect(() => {
-        setTaskFallbackRetried(false);
-    }, [taskSessionId]);
-
-    // Widen fallback resolution window only after a real retry boundary.
-    React.useEffect(() => {
-        if (!isTaskTool || taskFallbackRetried || explicitTaskSessionId != null || taskSessionId != null || isFinalized) {
-            return;
-        }
-
-        const sinceStart =
-            typeof taskSessionResolutionStart === 'number'
-                ? Date.now() - taskSessionResolutionStart
-                : 0;
-        const delay = Math.max(0, TASK_TOOL_FALLBACK_RETRY_MS - sinceStart);
-
-        if (typeof window === 'undefined') {
-            setTaskFallbackRetried(true);
-            return;
-        }
-
-        const timer = window.setTimeout(() => {
-            setTaskFallbackRetried(true);
-        }, delay);
-
-        return () => {
-            window.clearTimeout(timer);
-        };
-    }, [
-        explicitTaskSessionId,
-        isFinalized,
-        isTaskTool,
-        taskFallbackRetried,
-        taskSessionId,
-        taskSessionResolutionStart,
-    ]);
 
     React.useEffect(() => {
         if (typeof time?.end === 'number' || typeof pinnedTime.end === 'number') {
@@ -2447,6 +2416,9 @@ const ToolPartContent: React.FC<ToolPartProps> = ({
         return normalizedPartTool === 'write' ? parseWriteLineCount(input) : null;
     }, [input, normalizedPartTool]);
     const isMultiFileApplyPatch = normalizedPartTool === 'apply_patch' && Array.isArray(metadata?.files) && (metadata?.files as []).length > 1;
+    const todoProgress = React.useMemo(() => {
+        return normalizedPartTool === 'todowrite' ? parseTodoProgress(input) : null;
+    }, [input, normalizedPartTool]);
     const normalizedPart = normalizedPartTool !== part.tool ? ({ ...part, tool: normalizedPartTool } as ToolPartType) : part;
     const descriptionPath = getToolDescriptionPath(normalizedPart, state, currentDirectory);
     const description = getToolDescription(normalizedPart, state, currentDirectory);
@@ -2471,12 +2443,111 @@ const ToolPartContent: React.FC<ToolPartProps> = ({
         }
         const title = (stateWithData as { title?: string }).title;
         if (typeof title === 'string' && title.trim().length > 0) {
+            if (input && typeof input === 'object') {
+                const taskIdCandidate = input.task_id || input.taskId || input.taskID;
+                if (typeof taskIdCandidate === 'string' && taskIdCandidate.trim().length > 0) {
+                    return title.trim() + ' (task: ' + taskIdCandidate.trim() + ')';
+                }
+            }
             return title;
         }
         const inputDesc = input?.description;
         if (typeof inputDesc === 'string' && inputDesc.trim().length > 0) {
+            const subagentTypeCandidate = input.subagent_type;
+            if (typeof subagentTypeCandidate === 'string' && subagentTypeCandidate.trim().length > 0) {
+                return subagentTypeCandidate.trim() + ' - ' + inputDesc.trim();
+            }
             return inputDesc;
         }
+
+        if (input && typeof input === 'object') {
+            const nameCandidate = input.name;
+            if (typeof nameCandidate === 'string' && nameCandidate.trim().length > 0) {
+                return nameCandidate.trim();
+            }
+
+            const commandCandidate = input.command;
+            if (typeof commandCandidate === 'string' && commandCandidate.trim().length > 0) {
+                return commandCandidate.trim();
+            }
+
+            const patternCandidate = input.pattern;
+            if (typeof patternCandidate === 'string' && patternCandidate.trim().length > 0) {
+                return 'pattern: ' + patternCandidate.trim();
+            }
+
+            const queryCandidate = input.query;
+            if (typeof queryCandidate === 'string' && queryCandidate.trim().length > 0) {
+                const repoCandidate = input.repo;
+                if (typeof repoCandidate === 'string' && repoCandidate.trim().length > 0) {
+                    return 'query: ' + queryCandidate.trim() + ' (repo: ' + repoCandidate.trim() + ')';
+                }
+                return 'query: ' + queryCandidate.trim();
+            }
+
+            const goalCandidate = input.goal;
+            if (typeof goalCandidate === 'string' && goalCandidate.trim().length > 0) {
+                return goalCandidate.trim();
+            }
+
+            const mcpNameCandidate = input.mcp_name;
+            if (typeof mcpNameCandidate === 'string' && mcpNameCandidate.trim().length > 0) {
+                const toolNameCandidate = input.tool_name;
+                if (typeof toolNameCandidate === 'string' && toolNameCandidate.trim().length > 0) {
+                    const args = input.arguments as Record<string, unknown> | undefined;
+                    const argCandidate = (typeof args?.url === 'string' ? args.url : undefined) 
+                        || (typeof args?.uri === 'string' ? args.uri : undefined) 
+                        || (typeof args?.time === 'number' ? String(args.time) + 's' : undefined);
+                    if ((toolNameCandidate.trim().toLowerCase() === 'browser_navigate'
+                        || toolNameCandidate.trim().toLowerCase() === 'browser_wait_for')
+                        && argCandidate) {
+                        return mcpNameCandidate.trim() + ' - ' + toolNameCandidate.trim() + ' ' + argCandidate;
+                    }
+                    return mcpNameCandidate.trim() + ' - ' + toolNameCandidate.trim();
+                }
+                return mcpNameCandidate.trim();
+            }
+
+            const toolNameCandidate = input.tool_name;
+            if (typeof toolNameCandidate === 'string' && toolNameCandidate.trim().length > 0) {
+                return toolNameCandidate.trim();
+            }
+
+            const subagentTypeCandidate = input.subagent_type;
+            if (typeof subagentTypeCandidate === 'string' && subagentTypeCandidate.trim().length > 0) {
+                return subagentTypeCandidate.trim();
+            }
+
+            const sessionIdCandidate = input.session_id;
+            if (typeof sessionIdCandidate === 'string' && sessionIdCandidate.trim().length > 0) {
+                return sessionIdCandidate.trim();
+            }
+
+            const taskIdCandidate = input.task_id || input.taskId || input.taskID;
+            if (typeof taskIdCandidate === 'string' && taskIdCandidate.trim().length > 0) {
+                return taskIdCandidate.trim();
+            }
+
+            const projectPathCandidate = input.projectPath || input.project_path || input.project;
+            if (typeof projectPathCandidate === 'string' && projectPathCandidate.trim().length > 0) {
+                const pathCandidate = input.path;
+                if (typeof pathCandidate === 'string' && pathCandidate.trim().length > 0) {
+                    return projectPathCandidate.trim() + '/' + pathCandidate.trim();
+                }
+                return projectPathCandidate.trim();
+            }
+
+            const filePathCandidate = input.filePath || input.file_path || input.path;
+            if (typeof filePathCandidate === 'string' && filePathCandidate.trim().length > 0) {
+                return filePathCandidate.trim();
+            }
+
+            const fileCandidate = input.file || input.filename || input.file_name;
+            if (typeof fileCandidate === 'string' && fileCandidate.trim().length > 0) {
+                return fileCandidate.trim();
+            }
+        }
+
         return null;
     }, [descriptionPath, normalizedPartTool, stateWithData, input]);
     const runtime = React.useContext(RuntimeAPIContext);
@@ -2667,6 +2738,14 @@ const ToolPartContent: React.FC<ToolPartProps> = ({
                                     <span style={{ color: 'var(--status-success)' }}>+{writeLineCount}</span>
                                 </span>
                             )}
+                            {todoProgress && (todoProgress.inProgress !== 0 || todoProgress.pending !== 0 || todoProgress.completed !== 0) && (
+                                <span className="flex-shrink-0 inline-flex items-center gap-0 typography-meta" style={{ fontSize: '0.8rem', lineHeight: '1' }}>(
+                                    {todoProgress.inProgress != 0 && (<span className={cn('font-medium', (todoProgress.pending !== 0 || todoProgress.completed !== 0) && 'me-2')} style={{ color: 'var(--foreground)' }}>{t('chat.todo.inProgress')}: {todoProgress.inProgress}</span>)}
+                                    {todoProgress.pending != 0 && (<span className={cn('font-medium', todoProgress.completed !== 0 && 'me-2')} style={{ color: 'var(--muted-foreground)' }}>{t('chat.todo.pending')}: {todoProgress.pending}</span>)}
+                                    {todoProgress.completed != 0 && (<span className="font-medium" style={{ color: 'var(--status-success)' }}>{t('chat.todo.completed')}: {todoProgress.completed}</span>)}
+                                )
+                                </span>
+                            )}
                         </div>
                     </div>
                 )}
@@ -2711,6 +2790,7 @@ const ToolPartContent: React.FC<ToolPartProps> = ({
                                 state={state}
                                 currentDirectory={currentDirectory}
                                 isExpanded={isExpanded}
+                                isMobile={isMobile}
                                 onShowPopup={onShowPopup}
                             />
                         </div>
